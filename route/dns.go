@@ -7,7 +7,6 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
-	"github.com/sagernet/sing-box/dns"
 	dnsOutbound "github.com/sagernet/sing-box/protocol/dns"
 	R "github.com/sagernet/sing-box/route/rule"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -19,10 +18,11 @@ import (
 
 func (r *Router) hijackDNSStream(ctx context.Context, conn net.Conn, metadata adapter.InboundContext) error {
 	r.searchProcessInfo(ctx, &metadata)
+	factory := r.sniffDNSObserver(metadata)
 	metadata.Destination = M.Socksaddr{}
 	for {
 		conn.SetReadDeadline(time.Now().Add(C.DNSTimeout))
-		err := dnsOutbound.HandleStreamDNSRequest(ctx, r.dns, conn, metadata)
+		err := dnsOutbound.HandleStreamDNSRequestWithResponseObserver(ctx, r.dns, conn, metadata, factory)
 		if err != nil {
 			if !E.IsClosedOrCanceled(err) {
 				return err
@@ -35,7 +35,7 @@ func (r *Router) hijackDNSStream(ctx context.Context, conn net.Conn, metadata ad
 
 func (r *Router) hijackDNSPacket(ctx context.Context, conn N.PacketConn, packetBuffers []*N.PacketBuffer, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) error {
 	r.searchProcessInfo(ctx, &metadata)
-	err := dnsOutbound.NewDNSPacketConnection(ctx, r.dns, conn, packetBuffers, metadata)
+	err := dnsOutbound.NewDNSPacketConnectionWithResponseObserver(ctx, r.dns, conn, packetBuffers, metadata, r.sniffDNSObserver(metadata))
 	N.CloseOnHandshakeFailure(conn, onClose, err)
 	if err != nil && !E.IsClosedOrCanceled(err) {
 		return E.Cause(err, "process DNS packet")
@@ -51,11 +51,15 @@ func (r *Router) HijackDNSPacket(ctx context.Context, payload []byte, writer N.P
 		return
 	}
 	r.searchProcessInfo(ctx, &metadata)
+	var handler dnsOutbound.ResponseHandler
+	if factory := r.sniffDNSObserver(metadata); factory != nil {
+		handler = factory()
+	}
 	destination := metadata.Destination
 	metadata.Destination = M.Socksaddr{}
 	r.dns.ExchangeAsync(adapter.WithContext(ctx, &metadata), &message, adapter.DNSQueryOptions{}, func(response *mDNS.Msg, exchangeErr error) {
 		if exchangeErr == nil {
-			exchangeErr = r.writeDNSPacketResponse(&message, response, writer, destination)
+			exchangeErr = dnsOutbound.WritePacketResponseWithResponseObserver(&message, response, writer, destination, handler)
 		}
 		if exchangeErr != nil && !R.IsRejected(exchangeErr) && !E.IsClosedOrCanceled(exchangeErr) {
 			r.logger.ErrorContext(ctx, E.Cause(exchangeErr, "process DNS packet"))
@@ -64,9 +68,5 @@ func (r *Router) HijackDNSPacket(ctx context.Context, payload []byte, writer N.P
 }
 
 func (r *Router) writeDNSPacketResponse(message *mDNS.Msg, response *mDNS.Msg, writer N.PacketWriter, destination M.Socksaddr) error {
-	responseBuffer, err := dns.TruncateDNSMessage(message, response, N.CalculateFrontHeadroom(writer), N.CalculateRearHeadroom(writer))
-	if err != nil {
-		return err
-	}
-	return writer.WritePacket(responseBuffer, destination)
+	return dnsOutbound.WritePacketResponseWithResponseObserver(message, response, writer, destination, nil)
 }

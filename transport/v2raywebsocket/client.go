@@ -108,9 +108,12 @@ func (c *Client) upgrade(conn net.Conn, requestURL *url.URL, headers http.Header
 		return nil, err
 	}
 	if reader != nil {
-		buffer := buf.NewSize(reader.Buffered())
-		_, err = buffer.ReadFullFrom(reader, buffer.Len())
+		defer ws.PutReader(reader)
+		buffered := reader.Buffered()
+		buffer := buf.NewSize(buffered)
+		_, err = buffer.ReadFullFrom(reader, buffered)
 		if err != nil {
+			buffer.Release()
 			conn.Close()
 			return nil, err
 		}

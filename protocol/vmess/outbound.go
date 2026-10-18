@@ -9,6 +9,7 @@ import (
 	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/common/mux"
 	"github.com/sagernet/sing-box/common/tls"
+	"github.com/sagernet/sing-box/common/udptrace"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -43,6 +44,8 @@ type Outbound struct {
 	tlsConfig       tls.Config
 	tlsDialer       tls.Dialer
 	transport       adapter.V2RayClientTransport
+	connectionSetup *connectionSetupLimiter
+	udpTrace        *udptrace.Manager
 	packetAddr      bool
 	xudp            bool
 }
@@ -53,10 +56,12 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		return nil, err
 	}
 	outbound := &Outbound{
-		Adapter:    outbound.NewAdapterWithDialerOptions(C.TypeVMess, tag, options.Network.Build(), options.DialerOptions),
-		logger:     logger,
-		dialer:     outboundDialer,
-		serverAddr: options.ServerOptions.Build(),
+		Adapter:         outbound.NewAdapterWithDialerOptions(C.TypeVMess, tag, options.Network.Build(), options.DialerOptions),
+		logger:          logger,
+		dialer:          outboundDialer,
+		serverAddr:      options.ServerOptions.Build(),
+		connectionSetup: newConnectionSetupLimiter(C.IsIos),
+		udpTrace:        udptrace.ManagerFromContext(ctx),
 	}
 	if options.TLS != nil {
 		outbound.tlsConfig, err = tls.NewClient(ctx, logger, options.Server, common.PtrValueOrDefault(options.TLS))
@@ -120,6 +125,9 @@ func (h *Outbound) MultiplexEnabled() bool {
 }
 
 func (h *Outbound) InterfaceUpdated(ctx context.Context) {
+	if h.connectionSetup != nil {
+		h.connectionSetup.reset()
+	}
 	if h.transport != nil {
 		h.transport.Close()
 	}
@@ -149,10 +157,18 @@ func (h *Outbound) CloseIdleConnections() {
 }
 
 func (h *Outbound) Close() error {
+	if h.connectionSetup != nil {
+		return h.connectionSetup.close(func() error {
+			return common.Close(common.PtrOrNil(h.multiplexDialer), h.transport)
+		})
+	}
 	return common.Close(common.PtrOrNil(h.multiplexDialer), h.transport)
 }
 
 func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	if N.NetworkName(network) == N.NetworkUDP {
+		h.traceUDPEntry(ctx, destination, true)
+	}
 	if h.multiplexDialer == nil {
 		switch N.NetworkName(network) {
 		case N.NetworkTCP:
@@ -173,9 +189,10 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 }
 
 func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	trace := h.traceUDPEntry(ctx, destination, false)
 	if h.multiplexDialer == nil {
 		h.logger.InfoContext(ctx, "outbound packet connection to ", destination)
-		return (*vmessDialer)(h).ListenPacket(ctx, destination)
+		return (*vmessDialer)(h).listenPacketWithTrace(ctx, destination, trace)
 	} else {
 		h.logger.InfoContext(ctx, "outbound multiplex packet connection to ", destination)
 		return h.multiplexDialer.ListenPacket(ctx, destination)
@@ -188,15 +205,7 @@ func (h *vmessDialer) DialContext(ctx context.Context, network string, destinati
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = h.Tag()
 	metadata.Destination = destination
-	var conn net.Conn
-	var err error
-	if h.transport != nil {
-		conn, err = h.transport.DialContext(ctx)
-	} else if h.tlsDialer != nil {
-		conn, err = h.tlsDialer.DialTLSContext(ctx, h.serverAddr)
-	} else {
-		conn, err = h.dialer.DialContext(ctx, N.NetworkTCP, h.serverAddr)
-	}
+	conn, err := h.dialServer(ctx)
 	if err != nil {
 		common.Close(conn)
 		return nil, err
@@ -212,18 +221,14 @@ func (h *vmessDialer) DialContext(ctx context.Context, network string, destinati
 }
 
 func (h *vmessDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	return h.listenPacketWithTrace(ctx, destination, nil)
+}
+
+func (h *vmessDialer) listenPacketWithTrace(ctx context.Context, destination M.Socksaddr, trace *udptrace.Trace) (net.PacketConn, error) {
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = h.Tag()
 	metadata.Destination = destination
-	var conn net.Conn
-	var err error
-	if h.transport != nil {
-		conn, err = h.transport.DialContext(ctx)
-	} else if h.tlsDialer != nil {
-		conn, err = h.tlsDialer.DialTLSContext(ctx, h.serverAddr)
-	} else {
-		conn, err = h.dialer.DialContext(ctx, N.NetworkTCP, h.serverAddr)
-	}
+	conn, err := h.dialServerWithTrace(ctx, trace)
 	if err != nil {
 		return nil, err
 	}
@@ -233,7 +238,9 @@ func (h *vmessDialer) ListenPacket(ctx context.Context, destination M.Socksaddr)
 		}
 		return packetaddr.NewConn(h.client.DialEarlyPacketConn(conn, M.Socksaddr{Fqdn: packetaddr.SeqPacketMagicAddress}), destination), nil
 	} else if h.xudp {
-		return h.client.DialEarlyXUDPPacketConn(conn, destination), nil
+		packetConn := h.client.DialEarlyXUDPPacketConn(conn, destination)
+		trace.Record(udptrace.StageObjectCreated, udptrace.Detail{})
+		return observeXUDPPacketConn(packetConn, trace), nil
 	} else {
 		return h.client.DialEarlyPacketConn(conn, destination), nil
 	}

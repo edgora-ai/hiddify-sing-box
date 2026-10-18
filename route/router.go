@@ -5,6 +5,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -31,6 +32,7 @@ type Router struct {
 	inbound           adapter.InboundManager
 	outbound          adapter.OutboundManager
 	dns               adapter.DNSRouter
+	sniffDNS          atomic.Pointer[sniffDNSAssociations]
 	dnsTransport      adapter.DNSTransportManager
 	connection        adapter.ConnectionManager
 	network           adapter.NetworkManager
@@ -101,6 +103,7 @@ func (r *Router) Initialize(rules []option.Rule, ruleSets []option.RuleSet) erro
 			r.ruleSetContents[tag] = ruleSetContent(options)
 		}
 	}
+	r.resetSniffDNSAssociations(r.rules)
 	return nil
 }
 
@@ -221,6 +224,7 @@ func (r *Router) Start(stage adapter.StartStage) error {
 }
 
 func (r *Router) Close() error {
+	r.sniffDNS.Store(nil)
 	monitor := taskmonitor.New(r.logger, C.StopTimeout)
 	var err error
 	if r.neighborResolver != nil {

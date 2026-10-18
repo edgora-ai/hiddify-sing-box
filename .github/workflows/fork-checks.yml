@@ -1,0 +1,75 @@
+name: Fork Go regressions
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-go-regressions-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regressions:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GOTOOLCHAIN: local
+      GOTELEMETRY: 'off'
+      CGO_ENABLED: '0'
+      GOFLAGS: ''
+      GOMAXPROCS: '4'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.3'
+          cache: false
+      - name: Verify fixed host toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          go version
+          test "$(go env GOVERSION)" = go1.26.3
+          test "$(go env GOOS)/$(go env GOARCH)" = linux/amd64
+          git submodule status --recursive
+      - name: Run reviewed host regression allowlist
+        shell: bash
+        run: |
+          set -euo pipefail
+          # No module-root, ./test, broad ./..., fuzz, benchmarks or old XUDP fixture.
+          # CGO is off: these checks do not run the race detector or Apple code.
+          run() {
+            local log
+            log=$(mktemp "$RUNNER_TEMP/hiddify-go.XXXXXX")
+            go test -json -tags='' -mod=readonly -count=1 -timeout=120s -p=2 -parallel=4 \
+              "${@:4}" -run "$2" "$1" | tee "$log"
+            python3 - "$log" "$3" <<'PY'
+          import json
+          import sys
+          with open(sys.argv[1], encoding='utf-8') as stream:
+              events = [json.loads(line) for line in stream if line.strip()]
+          ran = {e['Test'] for e in events if e.get('Action') == 'run' and '/' not in e.get('Test', '/')}
+          passed = {e['Test'] for e in events if e.get('Action') == 'pass' and '/' not in e.get('Test', '/')}
+          skipped = [e['Test'] for e in events if e.get('Action') == 'skip' and e.get('Test')]
+          if len(ran) != int(sys.argv[2]) or passed != ran or skipped:
+              raise SystemExit(f'incomplete allowlist: ran={len(ran)}, passed={len(passed)}, skipped={skipped}')
+          print(f'Verified {len(passed)} completed top-level allowlist tests; no skipped cases')
+          PY
+          }
+          run ./protocol/dns '^TestH_ResponseObserver.*$' 9
+          run ./route '^TestH_(SniffDNS|SniffPacketBuffer).*$' 55
+          run ./common/sniff '^Test(SniffTLSClientHelloInfo.*|FallbackProxyDomain.*)$' 11
+          run ./service/oomkiller '^Test(NetworkExtension(DefaultPollInterval|MinOnlyPollIntervalRetained|ExplicitPollIntervalRetained)|Other(DefaultPollIntervalsUnchanged|MinOnlyPollIntervalsUnchanged)|ExplicitPollIntervalBoundsRejectReversed)$' 6
+          run ./protocol/vmess '^Test(VMess(ConnectionSetup.*|WebsocketEarlyDataDefault)|UDPStage(EntryMatching|UnsupportedEntry|PrefixWindow|ReadTapShortReadAndEOF|ReadTapConcurrent|PacketMethodsAndCapabilities|ClearAndDeadlineTransparency|DormantAndUnsupportedTypes|ScopedBackend|AdmissionCancellation|QueuedAdmissionAndExpiry))$' 22
+          run ./transport/v2raywebsocket '^TestH_WebsocketUpgradeBufferedFrames$' 1
+          run ./common/udptrace '^TestUDPTrace.*$' 22
+          run ./experimental/clashapi '^TestUDPStageTrace_.*$' 16
+          # release/LDFLAGS and cmd/internal/build_shared/flags.go already require this.
+          # It relaxes linkname checks for this binary, not the eight tests above.
+          printf '%s\n' 'libbox uses existing production -checklinkname=0 (binary-wide linkname relaxation); private profiler ABI remains untested'
+          run ./experimental/libbox '^TestNeighborSubscription(CloseUnblocksRead|ConcurrentClose|CloseWithoutReader)$' 3 -ldflags=-checklinkname=0

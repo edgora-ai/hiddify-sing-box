@@ -3,11 +3,12 @@
 package libbox
 
 import (
+	"errors"
+	"io"
 	"net"
 	"net/netip"
 	"os"
 	"slices"
-	"time"
 
 	"github.com/sagernet/sing-box/route"
 	"github.com/sagernet/sing/common/buf"
@@ -26,26 +27,41 @@ func SubscribeNeighborTable(listener NeighborUpdateListener) (*NeighborSubscript
 	for _, entry := range entries {
 		table[entry.Address] = entry.MACAddress
 	}
-	listener.UpdateNeighborTable(tableToIterator(table))
 	routeSocket, err := unix.Socket(unix.AF_ROUTE, unix.SOCK_RAW, 0)
 	if err != nil {
 		return nil, E.Cause(err, "open route socket")
 	}
 	err = unix.SetNonblock(routeSocket, true)
 	if err != nil {
-		unix.Close(routeSocket)
+		_ = unix.Close(routeSocket)
 		return nil, E.Cause(err, "set route socket nonblock")
 	}
-	subscription := &NeighborSubscription{
-		done: make(chan struct{}),
+	routeSocketFile := os.NewFile(uintptr(routeSocket), "route")
+	if routeSocketFile == nil {
+		_ = unix.Close(routeSocket)
+		return nil, E.Cause(os.ErrInvalid, "wrap route socket")
 	}
-	go subscription.loop(listener, routeSocket, table)
+	subscription := &NeighborSubscription{
+		done:   make(chan struct{}),
+		reader: routeSocketFile,
+	}
+	subscription.start(listener, table)
 	return subscription, nil
 }
 
-func (s *NeighborSubscription) loop(listener NeighborUpdateListener, routeSocket int, table map[netip.Addr]net.HardwareAddr) {
-	routeSocketFile := os.NewFile(uintptr(routeSocket), "route")
-	defer routeSocketFile.Close()
+func (s *NeighborSubscription) start(listener NeighborUpdateListener, table map[netip.Addr]net.HardwareAddr) {
+	// Own the reader before the synchronous callback, which may cancel the subscription.
+	listener.UpdateNeighborTable(tableToIterator(table))
+	select {
+	case <-s.done:
+		return
+	default:
+	}
+	go s.loop(listener, table)
+}
+
+func (s *NeighborSubscription) loop(listener NeighborUpdateListener, table map[netip.Addr]net.HardwareAddr) {
+	defer s.Close()
 	buffer := buf.NewPacket()
 	defer buffer.Release()
 	for {
@@ -54,12 +70,10 @@ func (s *NeighborSubscription) loop(listener NeighborUpdateListener, routeSocket
 			return
 		default:
 		}
-		tv := unix.NsecToTimeval(int64(3 * time.Second))
-		_ = unix.SetsockoptTimeval(routeSocket, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &tv)
-		n, err := routeSocketFile.Read(buffer.FreeBytes())
+		n, err := s.reader.Read(buffer.FreeBytes())
 		if err != nil {
-			if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
-				continue
+			if errors.Is(err, io.EOF) {
+				return
 			}
 			select {
 			case <-s.done:

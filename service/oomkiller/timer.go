@@ -72,6 +72,9 @@ func buildTimerConfig(options option.OOMKillerServiceOptions, memoryLimit uint64
 	}
 
 	maxInterval := defaultMaxInterval
+	if policyMode == policyModeNetworkExtension {
+		maxInterval = max(defaultArmedInterval, minInterval)
+	}
 	if options.MaxInterval != 0 {
 		maxInterval = time.Duration(options.MaxInterval.Build())
 		if maxInterval <= 0 {
