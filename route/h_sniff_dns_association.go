@@ -71,10 +71,10 @@ func newSniffDNSAssociations(capacity int, maxTTL time.Duration, now func() time
 func (s *sniffDNSAssociations) record(inbound string, client netip.Addr, response *mDNS.Msg) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.recordLocked(inbound, client, response)
+	s.recordLocked(inbound, client, response, s.now())
 }
 
-func (s *sniffDNSAssociations) recordLocked(inbound string, client netip.Addr, response *mDNS.Msg) {
+func (s *sniffDNSAssociations) recordLocked(inbound string, client netip.Addr, response *mDNS.Msg, now time.Time) {
 	if inbound == "" || !sniffDNSValidAddress(client) || response == nil || len(response.Question) != 1 {
 		return
 	}
@@ -85,7 +85,7 @@ func (s *sniffDNSAssociations) recordLocked(inbound string, client netip.Addr, r
 	}
 	key := sniffDNSAssociationKey{inbound: inbound, client: client, domain: domain, queryType: question.Qtype}
 
-	s.removeLocked(s.entries[key])
+	s.revokeLocked(key)
 	if response.Response && response.Opcode == mDNS.OpcodeQuery && question.Qclass == mDNS.ClassINET && response.Rcode == mDNS.RcodeNameError {
 		otherKey := key
 		if question.Qtype == mDNS.TypeA {
@@ -93,14 +93,13 @@ func (s *sniffDNSAssociations) recordLocked(inbound string, client netip.Addr, r
 		} else {
 			otherKey.queryType = mDNS.TypeA
 		}
-		s.removeLocked(s.entries[otherKey])
+		s.revokeLocked(otherKey)
 	}
 	if s.capacity <= 0 || s.maxTTL <= 0 || !response.Response || response.Opcode != mDNS.OpcodeQuery ||
 		response.Truncated || response.Zero || response.Rcode != mDNS.RcodeSuccess || question.Qclass != mDNS.ClassINET {
 		return
 	}
 
-	now := s.now()
 	addresses := sniffDNSAnswerAddresses(response.Answer, domain, question.Qtype, s.maxTTL, now)
 	if len(addresses) == 0 {
 		return
@@ -171,6 +170,17 @@ func (s *sniffDNSAssociations) clear() {
 	}
 	s.pending = make(map[sniffDNSAssociationKey][]*sniffDNSDelivery)
 	s.pendingCount = 0
+}
+
+// Preparation order does not establish wire-write order. A successful replacement
+// or revocation fences every overlapping pending positive, even one prepared
+// later. Keep the fence on the bounded pending object until its completion/clear,
+// without retaining per-key tombstones or locking across network writes.
+func (s *sniffDNSAssociations) revokeLocked(key sniffDNSAssociationKey) {
+	s.removeLocked(s.entries[key])
+	for _, delivery := range s.pending[key] {
+		delivery.invalidated = true
+	}
 }
 
 func (s *sniffDNSAssociations) removeLocked(element *list.Element) {

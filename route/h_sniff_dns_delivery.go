@@ -11,15 +11,18 @@ import (
 const sniffDNSDeliveryWait = 200 * time.Millisecond
 
 type sniffDNSDelivery struct {
-	key        sniffDNSAssociationKey
-	addresses  map[netip.Addr]time.Time
-	done       chan struct{}
-	registered bool
-	finished   bool
+	key         sniffDNSAssociationKey
+	addresses   map[netip.Addr]time.Time
+	done        chan struct{}
+	registered  bool
+	invalidated bool
+	finished    bool
 }
 
 // beginDelivery publishes only a pending write, never an authorization. The
-// completion commits an answer only after its actual wire write succeeds.
+// completion commits an answer only after its actual wire write succeeds. Only
+// registered, unfenced positives may authorize: at either pending limit, decline
+// authorization rather than let an untracked callback bypass revocation.
 func (s *sniffDNSAssociations) beginDelivery(inbound string, client netip.Addr, response *mDNS.Msg) func(error) {
 	if response == nil {
 		return nil
@@ -27,6 +30,8 @@ func (s *sniffDNSAssociations) beginDelivery(inbound string, client netip.Addr, 
 	response = response.Copy()
 	s.mu.Lock()
 	generation := s.generation
+	// Start TTLs before the write; a delayed completion must not renew them.
+	preparedAt := s.now()
 	delivery := &sniffDNSDelivery{done: make(chan struct{})}
 	if inbound != "" && sniffDNSValidAddress(client) && len(response.Question) == 1 &&
 		response.Response && response.Opcode == mDNS.OpcodeQuery && !response.Truncated && !response.Zero &&
@@ -35,7 +40,7 @@ func (s *sniffDNSAssociations) beginDelivery(inbound string, client netip.Addr, 
 		domain, valid := sniffDNSDomain(question.Name)
 		if valid && question.Qclass == mDNS.ClassINET && (question.Qtype == mDNS.TypeA || question.Qtype == mDNS.TypeAAAA) {
 			delivery.key = sniffDNSAssociationKey{inbound: inbound, client: client, domain: domain, queryType: question.Qtype}
-			delivery.addresses = sniffDNSAnswerAddresses(response.Answer, domain, question.Qtype, s.maxTTL, s.now())
+			delivery.addresses = sniffDNSAnswerAddresses(response.Answer, domain, question.Qtype, s.maxTTL, preparedAt)
 			if len(delivery.addresses) > 0 && s.pendingCount < s.capacity && len(s.pending[delivery.key]) < 4 {
 				s.pending[delivery.key] = append(s.pending[delivery.key], delivery)
 				s.pendingCount++
@@ -51,8 +56,9 @@ func (s *sniffDNSAssociations) beginDelivery(inbound string, client netip.Addr, 
 			return
 		}
 		delivery.finished = true
-		if writeErr == nil && generation == s.generation {
-			s.recordLocked(inbound, client, response)
+		if writeErr == nil && generation == s.generation && !delivery.invalidated &&
+			(len(delivery.addresses) == 0 || delivery.registered) {
+			s.recordLocked(inbound, client, response, preparedAt)
 		}
 		if delivery.registered {
 			pending := s.pending[delivery.key]
