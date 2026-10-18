@@ -1,5 +1,10 @@
 package libbox
 
+import (
+	"io"
+	"sync"
+)
+
 type NeighborEntry struct {
 	Address    string
 	MacAddress string
@@ -12,9 +17,16 @@ type NeighborEntryIterator interface {
 }
 
 type NeighborSubscription struct {
-	done chan struct{}
+	done      chan struct{}
+	reader    io.ReadCloser
+	closeOnce sync.Once
 }
 
 func (s *NeighborSubscription) Close() {
-	close(s.done)
+	s.closeOnce.Do(func() {
+		close(s.done)
+		if s.reader != nil {
+			_ = s.reader.Close()
+		}
+	})
 }
