@@ -69,3 +69,4 @@ jobs:
           run ./transport/v2raywebsocket '^TestH_WebsocketUpgradeBufferedFrames$' 1
           run ./common/udptrace '^TestUDPTrace.*$' 22
           run ./experimental/clashapi '^TestUDPStageTrace_.*$' 16
+          run ./experimental/libbox '^TestNeighborSubscription(CloseUnblocksRead|ConcurrentClose|CloseWithoutReader)$' 3
