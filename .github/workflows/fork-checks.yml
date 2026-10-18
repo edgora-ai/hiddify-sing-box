@@ -47,7 +47,7 @@ jobs:
             local log
             log=$(mktemp "$RUNNER_TEMP/hiddify-go.XXXXXX")
             go test -json -tags='' -mod=readonly -count=1 -timeout=120s -p=2 -parallel=4 \
-              -run "$2" "$1" | tee "$log"
+              "${@:4}" -run "$2" "$1" | tee "$log"
             python3 - "$log" "$3" <<'PY'
           import json
           import sys
@@ -69,4 +69,7 @@ jobs:
           run ./transport/v2raywebsocket '^TestH_WebsocketUpgradeBufferedFrames$' 1
           run ./common/udptrace '^TestUDPTrace.*$' 22
           run ./experimental/clashapi '^TestUDPStageTrace_.*$' 16
-          run ./experimental/libbox '^TestNeighborSubscription(CloseUnblocksRead|ConcurrentClose|CloseWithoutReader)$' 3
+          # release/LDFLAGS and cmd/internal/build_shared/flags.go already require this.
+          # It relaxes linkname checks for this binary, not the eight tests above.
+          printf '%s\n' 'libbox uses existing production -checklinkname=0 (binary-wide linkname relaxation); private profiler ABI remains untested'
+          run ./experimental/libbox '^TestNeighborSubscription(CloseUnblocksRead|ConcurrentClose|CloseWithoutReader)$' 3 -ldflags=-checklinkname=0
