@@ -14,6 +14,7 @@ import (
 
 	"github.com/sagernet/cors"
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/udptrace"
 	"github.com/sagernet/sing-box/common/urltest"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/experimental"
@@ -53,6 +54,7 @@ type Server struct {
 	logger         log.Logger
 	httpServer     *http.Server
 	trafficManager *trafficontrol.Manager
+	udpStageTrace  *udptrace.Manager
 	urlTestHistory *urltest.HistoryStorage
 	clashMode      *clashmode.Manager
 	logDebug       bool
@@ -103,6 +105,9 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 	if options.StoreMode || options.StoreSelected || options.StoreFakeIP || options.CacheFile != "" || options.CacheID != "" {
 		return nil, E.New("cache_file and related fields in Clash API is deprecated in sing-box 1.8.0, use experimental.cache_file instead.")
 	}
+	if manager := udptrace.ManagerFromContext(ctx); udpStageTraceControllerAllowed(options.ExternalController, options.Secret, manager) {
+		s.udpStageTrace = manager
+	}
 	allowedOrigins := options.AccessControlAllowOrigin
 	if len(allowedOrigins) == 0 {
 		allowedOrigins = []string{"*"}
@@ -116,6 +121,9 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 	})
 	chiRouter.Use(cors.Handler)
 	chiRouter.Group(func(r chi.Router) {
+		if s.udpStageTrace != nil {
+			r.Use(udpStageTraceGuard(options.Secret))
+		}
 		r.Use(authentication(options.Secret))
 		r.Get("/", hello(options.ExternalUI != ""))
 		r.Get("/logs", getLogs(s.ctx, logFactory))
@@ -131,6 +139,9 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		r.Mount("/profile", profileRouter())
 		r.Mount("/cache", cacheRouter(ctx))
 		r.Mount("/dns", dnsRouter(s.dnsRouter))
+		if s.udpStageTrace != nil {
+			r.Handle(udpStageTracePath, udpStageTraceHandler(s.udpStageTrace))
+		}
 
 		s.setupMetaAPI(r)
 	})
@@ -144,6 +155,9 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 			r.Get("/ui", http.RedirectHandler("/ui/", http.StatusMovedPermanently).ServeHTTP)
 			r.Handle("/ui/*", http.StripPrefix("/ui/", http.FileServer(Dir(s.externalUI))))
 		})
+	}
+	if s.udpStageTrace != nil {
+		s.udpStageTrace.Enable()
 	}
 	return s, nil
 }
@@ -171,11 +185,13 @@ func (s *Server) Start(stage adapter.StartStage) error {
 			break
 		}
 		if err != nil {
+			s.udpStageTrace.Disable()
 			return E.Cause(err, "external controller listen error")
 		}
 		s.logger.Info("restful api listening at ", listener.Addr())
 		go func() {
 			err = s.httpServer.Serve(listener)
+			s.udpStageTrace.Disable()
 			if err != nil && !errors.Is(err, http.ErrServerClosed) {
 				s.logger.Error("external controller serve error: ", err)
 			}
@@ -185,6 +201,7 @@ func (s *Server) Start(stage adapter.StartStage) error {
 }
 
 func (s *Server) Close() error {
+	s.udpStageTrace.Disable()
 	return common.Close(
 		common.PtrOrNil(s.httpServer),
 		s.trafficManager,

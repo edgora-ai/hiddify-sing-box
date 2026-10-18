@@ -113,6 +113,7 @@ func (r *Router) ReloadRules(ctx context.Context, ruleOptions []option.Rule, rul
 
 	r.rulesAccess.Lock()
 	r.rules = newRules
+	r.resetSniffDNSAssociations(newRules)
 	r.rulesAccess.Unlock()
 	for _, rule := range oldRules {
 		_ = rule.Close()

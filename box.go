@@ -23,6 +23,7 @@ import (
 	"github.com/sagernet/sing-box/common/taskmonitor"
 	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/common/trafficcontrol"
+	"github.com/sagernet/sing-box/common/udptrace"
 	"github.com/sagernet/sing-box/common/urltest"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/dns"
@@ -66,6 +67,7 @@ type Box struct {
 	referenceManager    *route.ReferenceManager
 	httpClientService   adapter.LifecycleService
 	internalService     []adapter.LifecycleService
+	udpTrace            *udptrace.Manager
 	done                chan struct{}
 	runningOptions      option.Options // H: base of a hot reload
 	reloadAccess        sync.Mutex     // H
@@ -123,6 +125,17 @@ func New(options Options) (*Box, error) {
 		ctx = context.Background()
 	}
 	ctx = service.ContextWithDefaultRegistry(ctx)
+	udpTrace, traceErr := udptrace.NewManager()
+	if traceErr != nil {
+		udpTrace = nil
+	}
+	ctx = udptrace.ContextWithManager(ctx, udpTrace)
+	keepUDPTrace := false
+	defer func() {
+		if !keepUDPTrace {
+			udpTrace.Close()
+		}
+	}()
 
 	endpointRegistry := service.FromContext[adapter.EndpointRegistry](ctx)
 	inboundRegistry := service.FromContext[adapter.InboundRegistry](ctx)
@@ -529,7 +542,7 @@ func New(options Options) (*Box, error) {
 		timeService.TimeService = ntpService
 		internalServices = append(internalServices, adapter.NewLifecycleService(ntpService, "ntp service"))
 	}
-	return &Box{
+	box := &Box{
 		ctx:                 ctx,
 		network:             networkManager,
 		endpoint:            endpointManager,
@@ -548,9 +561,12 @@ func New(options Options) (*Box, error) {
 		logFactory:          logFactory,
 		logger:              logFactory.Logger(),
 		internalService:     internalServices,
+		udpTrace:            udpTrace,
 		done:                make(chan struct{}),
 		runningOptions:      options.Options,
-	}, nil
+	}
+	keepUDPTrace = true
+	return box, nil
 }
 
 func (s *Box) PreStart() error {
@@ -668,6 +684,7 @@ func (s *Box) start() error {
 }
 
 func (s *Box) Close() error {
+	s.udpTrace.Close()
 	select {
 	case <-s.done:
 		return os.ErrClosed

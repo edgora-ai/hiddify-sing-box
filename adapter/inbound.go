@@ -71,6 +71,10 @@ type InboundContext struct {
 	SnifferNames []string
 	SniffError   error
 
+	// A successful, explicitly enabled stream sniff; never populated by reverse DNS.
+	SniffedDomainForFallbackProxy string
+	SniffedDestination            M.Socksaddr
+
 	// cache
 
 	// Deprecated: implement in rule action

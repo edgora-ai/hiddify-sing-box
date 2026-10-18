@@ -326,8 +326,9 @@ func (r *RejectActionOptions) UnmarshalJSON(bytes []byte) error {
 }
 
 type RouteActionSniff struct {
-	Sniffer badoption.Listable[string] `json:"sniffer,omitempty" enum:"tls,http,quic,dns,stun,bittorrent,dtls,ssh,rdp,ntp"`
-	Timeout badoption.Duration         `json:"timeout,omitempty"`
+	Sniffer                        badoption.Listable[string] `json:"sniffer,omitempty" enum:"tls,http,quic,dns,stun,bittorrent,dtls,ssh,rdp,ntp"`
+	Timeout                        badoption.Duration         `json:"timeout,omitempty"`
+	PreserveDomainForFallbackProxy bool                       `json:"preserve_domain_for_fallback_proxy,omitempty"`
 }
 
 type RouteActionResolve struct {

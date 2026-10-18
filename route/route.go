@@ -152,6 +152,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 		buf.ReleaseMulti(buffers)
 		return err
 	}
+	r.preserveFallbackProxyDomain(ctx, &metadata, selectedRule, chain)
 	for _, buffer := range buffers {
 		conn = bufio.NewCachedConn(conn, buffer)
 	}
@@ -779,7 +780,13 @@ func (r *Router) actionSniff(
 		)
 		metadata.SnifferNames = action.SnifferNames
 		metadata.SniffError = err
+		metadata.SniffedDomainForFallbackProxy = ""
+		metadata.SniffedDestination = M.Socksaddr{}
 		if err == nil {
+			if action.PreserveDomainForFallbackProxy {
+				metadata.SniffedDomainForFallbackProxy = sniff.FallbackProxyDomain(metadata.Protocol, append(inputBuffers, sniffBuffer))
+				metadata.SniffedDestination = metadata.Destination
+			}
 			//goland:noinspection GoDeprecation
 			if action.OverrideDestination && M.IsDomainName(metadata.Domain) {
 				metadata.Destination = M.Socksaddr{
@@ -872,6 +879,7 @@ func (r *Router) actionSniff(
 					return
 				}
 			} else {
+				sniffBuffer = compactSniffPacketBuffer(sniffBuffer, C.IsIos)
 				if quicMoreData() {
 					err = sniff.PeekPacket(
 						ctx,
